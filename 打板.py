@@ -66,9 +66,9 @@ class MyDataset(Dataset):
         past_values, future_values = self.data[index]
         return {"past_values": past_values, "future_values": future_values}
 
-# TODO: 尝试更多情况
+
 class CustomLoss(nn.Module):
-    def __init__(self, penalty_up_up=0.8, penalty_up_down=5, penalty_down_up=1, penalty_down_down=0.8, penalty_high_down=8):
+    def __init__(self, penalty_up_up=1, penalty_up_down=1.5, penalty_down_up=1.2, penalty_down_down=1, penalty_high_down=1.8):
         super(CustomLoss, self).__init__()
         self.penalty_up_up = penalty_up_up          # 预测上涨实际上涨
         self.penalty_up_down = penalty_up_down      # 预测上涨实际下跌
@@ -77,7 +77,9 @@ class CustomLoss(nn.Module):
         self.penalty_high_down = penalty_high_down  # 第二天最高价小于昨日收盘价
 
     def forward(self, outputs, future_values, past_values):
-        base_loss = abs(outputs - future_values)
+        base_loss1 =  torch.abs(outputs - future_values)
+        base_loss2 = (outputs - future_values)**2
+        base_loss = torch.min(base_loss1, base_loss2)
 
         last_day_past_values = past_values[:, -1:, :5]
         last_day_open, last_day_close, last_day_high, last_day_low, last_day_ave = [
@@ -118,17 +120,18 @@ class CustomLoss(nn.Module):
 
 
 def train_model(train_dataset, val_dataset, epoch_num, check_point_path=None):
-    train_loader = DataLoader(train_dataset, batch_size=192, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=192, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=86, shuffle=True)
+    if val_dataset != None:
+        val_loader = DataLoader(val_dataset, batch_size=86, shuffle=False)
 
     config = PatchTSMixerConfig(
         context_length=60,
         prediction_length=1,
-        patch_length=10,
+        patch_length=5,
         num_input_channels=24,
-        patch_stride=5,
-        d_model=48,
-        num_layers=6,
+        patch_stride=1,
+        d_model=24,
+        num_layers=12,
         expansion_factor=2,
         dropout=0.2,
         head_dropout=0.2,
@@ -136,12 +139,17 @@ def train_model(train_dataset, val_dataset, epoch_num, check_point_path=None):
         scaling="std",
     )
     model = PatchTSMixerForPrediction(config).cuda()
+    optimizer = torch.optim.AdamW(model.parameters())
     model.train()
     if check_point_path != None:
-        model.load_state_dict(torch.load(check_point_path))
+        checkpoint = torch.load(check_point_path)
+        model.load_state_dict(checkpoint['model'])
+        if 'optimizer' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            
     loss_fn = CustomLoss().cuda()
-    optimizer = torch.optim.AdamW(model.parameters())
 
+    # 模型检查点保存路径
     save_dir = "./model_checkpoints"
     os.makedirs(save_dir, exist_ok=True)
 
@@ -169,46 +177,61 @@ def train_model(train_dataset, val_dataset, epoch_num, check_point_path=None):
 
             total_train_loss += loss.item()
 
+            # 更新进度条的后缀信息，显示当前损失
             progress_bar.set_postfix({'loss': '{:.4f}'.format(loss.item())})
 
         avg_train_loss = total_train_loss / len(train_loader)
         print(f"Train Loss: {avg_train_loss:.4f}")
 
-        # 验证阶段
-        model.eval()
-        total_val_loss = 0
-        with torch.no_grad():
-            progress_bar = tqdm(
-                val_loader, desc=f'Evaling Epoch {epoch + 1}', unit='batch')
-            for batch in progress_bar:
-                past_values = batch["past_values"]
-                future_values = batch["future_values"][:, :, :5]
-                outputs = model(past_values)['prediction_outputs'][:, :, :5]
-                loss = loss_fn(outputs, future_values, past_values)
-                total_val_loss += loss.item()
-                progress_bar.set_postfix(
-                    {'loss': '{:.4f}'.format(loss.item())})
+        if val_dataset != None:
+            # 验证阶段
+            model.eval()
+            total_val_loss = 0
+            with torch.no_grad():
+                progress_bar = tqdm(
+                    val_loader, desc=f'Evaling Epoch {epoch + 1}', unit='batch')
+                for batch in progress_bar:
+                    past_values = batch["past_values"]
+                    future_values = batch["future_values"][:, :, :5]
+                    outputs = model(past_values)['prediction_outputs'][:, :, :5]
+                    loss = loss_fn(outputs, future_values, past_values)
+                    total_val_loss += loss.item()
+                    progress_bar.set_postfix(
+                        {'loss': '{:.4f}'.format(loss.item())})
 
-        avg_val_loss = total_val_loss / len(val_loader)
-        print(f"Validation Loss: {avg_val_loss:.4f}")
+            avg_val_loss = total_val_loss / len(val_loader)
+            print(f"Validation Loss: {avg_val_loss:.4f}")
 
-        # 保存最新的模型
+        # 保存最新模型和优化器状态
         latest_model_path = os.path.join(save_dir, f"model_latest.pth")
-        torch.save(model.state_dict(), latest_model_path)
+        checkpoint = {
+            'model': model.state_dict(),         # 模型状态
+            'optimizer': optimizer.state_dict()  # 优化器状态
+        }
+        torch.save(checkpoint, latest_model_path)
 
-        # 更新最佳模型
-        if avg_val_loss < max(best_val_losses):
-            worst_best_idx = best_val_losses.index(max(best_val_losses))
-            best_val_losses[worst_best_idx] = avg_val_loss
-            best_model_path = os.path.join(
-                save_dir, f"model_best_{worst_best_idx}.pth")
-            torch.save(model.state_dict(), best_model_path)
-            best_model_paths[worst_best_idx] = best_model_path
-
-        # 日志记录
-        log_str = f"Epoch {epoch + 1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}\n"
-        with open(os.path.join(save_dir, "training_log.txt"), "a") as log_file:
-            log_file.write(log_str)
+        if val_dataset != None:
+            # 更新最佳模型
+            if avg_val_loss < max(best_val_losses):
+                worst_best_idx = best_val_losses.index(max(best_val_losses))
+                best_val_losses[worst_best_idx] = avg_val_loss
+                best_model_path = os.path.join(
+                    save_dir, f"model_best_{worst_best_idx}.pth")
+                checkpoint = {
+                    'model': model.state_dict(),         # 模型状态
+                    'optimizer': optimizer.state_dict()  # 优化器状态
+                }
+                torch.save(checkpoint, best_model_path)
+                best_model_paths[worst_best_idx] = best_model_path
+            # 日志记录
+            log_str = f"Epoch {epoch + 1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}\n"
+            with open(os.path.join(save_dir, "training_log.txt"), "a") as log_file:
+                log_file.write(log_str)
+        else:
+            # 日志记录
+            log_str = f"Epoch {epoch + 1}, Train Loss: {avg_train_loss:.4f}\n"
+            with open(os.path.join(save_dir, "training_log.txt"), "a") as log_file:
+                log_file.write(log_str)
 
 
 if __name__ == "__main__":
